@@ -1,0 +1,13 @@
+﻿venv/
+.venv/
+__pycache__/
+*.pyc
+*.so
+*.dist-info/
+package/
+bin/
+*_old/
+*.libs/
+.env
+.env.*
+!.env.example
