@@ -1,0 +1,8 @@
+aws s3 cp s3://snpeetam.com/ s3://snpeetam.com/ --recursive --metadata-directive REPLACE --cache-control "no-cache, no-store, must-revalidate" --region ap-south-1 --profile temple-new
+
+
+aws cloudfront create-invalidation --distribution-id EFB2RWIFOUAMJ --paths "/*" --profile temple-new
+
+
+ aws s3 cp ./dist s3://snpeetam.com/ --recursive --exclude "*" --include "*.html" --content-type "text/html"
+     --cache-control "no-cache, no-store, must-revalidate" --region ap-south-1 --profile temple-new

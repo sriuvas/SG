@@ -1,0 +1,495 @@
+
+import time
+import uuid
+from datetime import datetime, timezone
+
+from boto3.dynamodb.types import TypeSerializer
+from botocore.exceptions import ClientError
+from fastapi import APIRouter, HTTPException, Depends
+from passlib.context import CryptContext
+
+from app.models.user import UserCreate, UserUpdate
+from app.auth.auth import get_current_user, require_admin
+from database import dynamodb
+
+
+router = APIRouter(
+    prefix="/api/users",
+    tags=["Users"]
+)
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto"
+)
+
+TABLE_NAME = "Users_Table"
+OTP_TABLE_NAME = "EmailOTP_Table"
+
+table = dynamodb.Table(TABLE_NAME)
+otp_table = dynamodb.Table(OTP_TABLE_NAME)
+
+# Converts Python values to the DynamoDB low-level API format.
+serializer = TypeSerializer()
+
+
+# ==================================================
+# GET - Get all users
+# Authenticated users
+# ==================================================
+
+@router.get("")
+def get_users(
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        response = table.scan()
+        users = response.get("Items", [])
+
+        while response.get("LastEvaluatedKey"):
+            response = table.scan(
+                ExclusiveStartKey=response["LastEvaluatedKey"]
+            )
+            users.extend(response.get("Items", []))
+
+        # Never expose password hashes.
+        for user in users:
+            user.pop("password_hash", None)
+
+        return {
+            "message": "Users retrieved successfully",
+            "users": users
+        }
+
+    except ClientError as exc:
+        print(
+            "Get users error:",
+            exc.response.get("Error", {}).get("Code", "Unknown")
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve users"
+        )
+
+
+# ==================================================
+# GET - Get current user's profile
+# Authenticated users
+# ==================================================
+
+@router.get("/me")
+def get_my_profile(
+    current_user: dict = Depends(get_current_user)
+):
+    user_id = current_user.get("user_id")
+
+    if not user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="User ID not found in authentication token"
+        )
+
+    try:
+        response = table.get_item(
+            Key={"user_id": user_id}
+        )
+
+        user = response.get("Item")
+
+        if not user:
+            raise HTTPException(
+                status_code=404,
+                detail="User profile not found"
+            )
+
+        return {
+            "message": "User profile retrieved successfully",
+            "user": {
+                "user_id": user.get("user_id"),
+                "name": user.get("name"),
+                "email": user.get("email"),
+                "phone": user.get("phone"),
+                "role": user.get("role")
+            }
+        }
+
+    except HTTPException:
+        raise
+
+    except ClientError as exc:
+        print(
+            "Get profile error:",
+            exc.response.get("Error", {}).get("Code", "Unknown")
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve user profile"
+        )
+
+
+# ==================================================
+# POST - Register a user
+# Requires verified email OTP.
+# Public registration always assigns role "User".
+# User creation and OTP consumption are atomic.
+# ==================================================
+
+@router.post("")
+def create_user(
+    user: UserCreate
+):
+    email = str(user.email).strip().lower()
+    now = int(time.time())
+
+    # 1. Retrieve the email verification record.
+    try:
+        otp_response = otp_table.get_item(
+            Key={"email": email},
+            ConsistentRead=True
+        )
+        otp_item = otp_response.get("Item")
+
+    except ClientError as exc:
+        print(
+            "OTP lookup error:",
+            exc.response.get("Error", {}).get("Code", "Unknown")
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to check email verification"
+        )
+
+    if (
+        not otp_item
+        or otp_item.get("purpose") != "registration"
+        or otp_item.get("verified") is not True
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Please verify your email with OTP before registering"
+        )
+
+    try:
+        verified_until = int(otp_item.get("verified_until", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=403,
+            detail="Email verification is invalid. Please verify again"
+        )
+
+    if verified_until <= now:
+        raise HTTPException(
+            status_code=403,
+            detail="Email verification expired. Please verify again"
+        )
+
+    # 2. Check whether the email is already registered.
+    # The transaction below also prevents concurrent requests from
+    # consuming the same OTP more than once.
+    try:
+        existing_users = []
+
+        scan_response = table.scan(
+            FilterExpression="#email = :email",
+            ExpressionAttributeNames={
+                "#email": "email"
+            },
+            ExpressionAttributeValues={
+                ":email": email
+            }
+        )
+
+        existing_users.extend(scan_response.get("Items", []))
+
+        while scan_response.get("LastEvaluatedKey"):
+            scan_response = table.scan(
+                FilterExpression="#email = :email",
+                ExpressionAttributeNames={
+                    "#email": "email"
+                },
+                ExpressionAttributeValues={
+                    ":email": email
+                },
+                ExclusiveStartKey=scan_response["LastEvaluatedKey"]
+            )
+            existing_users.extend(scan_response.get("Items", []))
+
+        if existing_users:
+            raise HTTPException(
+                status_code=400,
+                detail="User with this email already exists"
+            )
+
+    except HTTPException:
+        raise
+
+    except ClientError as exc:
+        print(
+            "Existing user lookup error:",
+            exc.response.get("Error", {}).get("Code", "Unknown")
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to check existing users"
+        )
+
+    # 3. Prepare the user record.
+    user_id = str(uuid.uuid4())
+    current_time = datetime.now(timezone.utc).isoformat()
+
+    item = {
+        "user_id": user_id,
+        "name": user.name,
+        "email": email,
+        "phone": user.phone,
+        "password_hash": pwd_context.hash(user.password),
+        # Never trust the public request's role field.
+        "role": "User",
+        "created_at": current_time,
+        "updated_at": current_time
+    }
+
+    # 4. Serialize every user attribute for the low-level
+    # DynamoDB client. This correctly handles strings and None.
+    try:
+        serialized_item = {
+            key: serializer.serialize(value)
+            for key, value in item.items()
+        }
+
+        # 5. Create the user AND consume the OTP in one transaction.
+        # If either condition fails, DynamoDB applies neither operation.
+        transaction_items = [
+            {
+                "Put": {
+                    "TableName": TABLE_NAME,
+                    "Item": serialized_item,
+                    "ConditionExpression": (
+                        "attribute_not_exists(#user_id)"
+                    ),
+                    "ExpressionAttributeNames": {
+                        "#user_id": "user_id"
+                    }
+                }
+            },
+            {
+                "Delete": {
+                    "TableName": OTP_TABLE_NAME,
+                    "Key": {
+                        "email": serializer.serialize(email)
+                    },
+                    "ConditionExpression": (
+                        "#verified = :verified "
+                        "AND #verified_until = :verified_until"
+                    ),
+                    "ExpressionAttributeNames": {
+                        "#verified": "verified",
+                        "#verified_until": "verified_until"
+                    },
+                    "ExpressionAttributeValues": {
+                        ":verified": serializer.serialize(True),
+                        ":verified_until": serializer.serialize(
+                            verified_until
+                        )
+                    }
+                }
+            }
+        ]
+
+        dynamodb.meta.client.transact_write_items(
+            TransactItems=transaction_items
+        )
+
+    except ClientError as exc:
+        error = exc.response.get("Error", {})
+        error_code = error.get("Code", "")
+
+        print(
+            "Registration transaction error code:",
+            error_code
+        )
+        print(
+            "Registration transaction error message:",
+            error.get("Message", "")
+        )
+
+        if error_code == "TransactionCanceledException":
+            reasons = exc.response.get("CancellationReasons", [])
+            print(
+                "Registration transaction cancellation reasons:",
+                reasons
+            )
+
+            # Do not reveal internal database details to the client.
+            # A fresh OTP may be needed if another request consumed it.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Registration could not be completed. "
+                    "The verification may have expired or already been used. "
+                    "Please check the registration status and request a new "
+                    "OTP if necessary."
+                )
+            )
+
+        if error_code == "ConditionalCheckFailedException":
+            raise HTTPException(
+                status_code=409,
+                detail="Registration could not be completed"
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to complete registration"
+        )
+
+    except (TypeError, ValueError) as exc:
+        print("Registration serialization error:", str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to prepare registration data"
+        )
+
+    # 6. Return the new user without its password hash.
+    response_user = item.copy()
+    response_user.pop("password_hash", None)
+
+    return {
+        "message": "User created successfully",
+        "user": response_user
+    }
+
+
+# ==================================================
+# PUT - Update a user
+# Admin only
+# ==================================================
+
+@router.put("/{user_id}")
+def update_user(
+    user_id: str,
+    user: UserUpdate,
+    current_user: dict = Depends(require_admin)
+):
+    user_id = user_id.strip()
+
+    try:
+        response = table.get_item(
+            Key={"user_id": user_id}
+        )
+
+        if "Item" not in response:
+            raise HTTPException(
+                status_code=404,
+                detail=f"User not found for user_id: {user_id}"
+            )
+
+        update_data = user.model_dump(
+            exclude_unset=True
+        )
+
+        if not update_data:
+            raise HTTPException(
+                status_code=400,
+                detail="No fields provided for update"
+            )
+
+        # Hash a new password if supplied.
+        if "password" in update_data:
+            update_data["password_hash"] = pwd_context.hash(
+                update_data.pop("password")
+            )
+
+        # Update timestamp.
+        update_data["updated_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        expression_parts = []
+        expression_values = {}
+        expression_names = {}
+
+        for index, (key, value) in enumerate(update_data.items()):
+            field_name = f"#field{index}"
+            value_name = f":value{index}"
+
+            expression_parts.append(
+                f"{field_name} = {value_name}"
+            )
+            expression_names[field_name] = key
+            expression_values[value_name] = value
+
+        table.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET " + ", ".join(expression_parts),
+            ExpressionAttributeNames=expression_names,
+            ExpressionAttributeValues=expression_values
+        )
+
+        updated_response = table.get_item(
+            Key={"user_id": user_id}
+        )
+
+        updated_user = updated_response.get("Item", {})
+        updated_user.pop("password_hash", None)
+
+        return {
+            "message": "User updated successfully",
+            "user": updated_user
+        }
+
+    except HTTPException:
+        raise
+
+    except ClientError as exc:
+        print(
+            "Update user error:",
+            exc.response.get("Error", {}).get("Code", "Unknown")
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to update user"
+        )
+
+
+# ==================================================
+# DELETE - Delete a user
+# Admin only
+# ==================================================
+
+@router.delete("/{user_id}")
+def delete_user(
+    user_id: str,
+    current_user: dict = Depends(require_admin)
+):
+    user_id = user_id.strip()
+
+    try:
+        response = table.delete_item(
+            Key={"user_id": user_id},
+            ReturnValues="ALL_OLD"
+        )
+
+        if "Attributes" not in response:
+            raise HTTPException(
+                status_code=404,
+                detail=f"User not found for user_id: {user_id}"
+            )
+
+        return {
+            "message": "User deleted successfully",
+            "user_id": user_id
+        }
+
+    except HTTPException:
+        raise
+
+    except ClientError as exc:
+        print(
+            "Delete user error:",
+            exc.response.get("Error", {}).get("Code", "Unknown")
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to delete user"
+        )
